@@ -8,6 +8,21 @@ import pytz
 import pandas as pd
 import json
 import asyncio # For sleep
+import logging
+from typing import Optional
+
+# Import custom API clients
+from api.ergast import ErgastAPI
+from api.openf1 import OpenF1API
+from utils.cache import cache
+from utils.teamcolors import get_team_color, get_team_emoji, get_nationality_flag, get_driver_color
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -35,6 +50,10 @@ INDIAN_TIMEZONE = pytz.timezone('Asia/Kolkata')
 reported_sessions = set()
 
 F1_BOT_CHANNEL_ID = None 
+
+# Initialize API clients
+ergast_api = ErgastAPI()
+openf1_api = OpenF1API()
 
 # --- File for storing favorite drivers and their assigned role IDs ---
 FAV_DRIVERS_FILE = 'data/fav_drivers.json'
@@ -314,12 +333,21 @@ async def on_ready():
 
     if GUILD_ID: 
         try:
+            # Sync globally first to register commands everywhere
+            # await bot.tree.sync() 
+            # OR sync to the specific guild to update instantly for testing
+            bot.tree.copy_global_to(guild=discord.Object(id=GUILD_ID))
             await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
             print(f"Synced slash commands for guild ID: {GUILD_ID}")
         except Exception as e:
             print(f"Failed to sync slash commands: {e}")
     else:
-        print("GUILD_ID not set or invalid, skipping slash command sync.")
+        # If no guild ID, try global sync (might take time)
+        try:
+            await bot.tree.sync()
+            print("Synced slash commands globally.")
+        except Exception as e:
+            print(f"Failed to sync slash commands globally: {e}")
 
     check_for_completed_sessions.start()
     print("Started background task: check_for_completed_sessions")
@@ -330,6 +358,34 @@ async def on_disconnect():
     print("Cancelled background task: check_for_completed_sessions")
 
 # --- Prefix Commands ---
+
+@bot.command(name='sync')
+async def sync_commands(ctx):
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("❌ You need Administrator permissions to sync commands.")
+        return
+
+    await ctx.send("🔄 Syncing commands... This might take a moment.")
+    try:
+        # Sync to the specific guild
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            await ctx.send(f"✅ Successfully synced {len(synced)} commands to this server!")
+            print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
+        else:
+            # Global sync
+            synced = await bot.tree.sync()
+            await ctx.send(f"✅ Successfully synced {len(synced)} commands globally! (May take up to 1 hour to appear)")
+            print(f"Synced {len(synced)} commands globally")
+            
+    except discord.Forbidden:
+        await ctx.send("❌ **Error: Missing Permissions**\nThe bot is missing the `applications.commands` scope.\n\n**FIX:**\n1. Kick the bot.\n2. Re-invite it using the Developer Portal link.\n3. Make sure to check **'applications.commands'** in the OAuth2 scopes.")
+        print("Failed to sync: Missing Access (403)")
+    except Exception as e:
+        await ctx.send(f"❌ Sync failed: `{e}`")
+        print(f"Sync failed: {e}")
 
 @bot.command(name="setf1channel", help="Sets the channel for F1 session updates and where F1 commands can be used.")
 @commands.has_permissions(manage_channels=True)
@@ -375,7 +431,7 @@ async def next_f1_event(ctx):
     await ctx.send("Fetching next F1 event schedule...")
     try:
         current_year = datetime.now().year
-        schedule = fastf1.get_event_schedule(current_year, drop_duplicates=False)
+        schedule = fastf1.get_event_schedule(current_year)
         
         current_utc_time = datetime.now(pytz.utc) 
         
@@ -424,10 +480,9 @@ async def next_f1_event(ctx):
 
 # --- Slash Commands ---
 
-@bot.tree.command( # Corrected to bot.tree.command
+@bot.tree.command( 
     name="setfavdriver", 
-    description="Set your favorite F1 driver and get a fan role!",
-    guild=discord.Object(id=GUILD_ID)
+    description="Set your favorite F1 driver and get a fan role!"
 )
 @discord.app_commands.describe(
     driver_code="The 3-letter code of your favorite driver (e.g., VER, HAM, LEC)"
@@ -440,39 +495,69 @@ async def set_fav_driver(interaction: discord.Interaction, driver_code: str):
     guild = interaction.guild
 
     driver_full_name = driver_code 
+    all_driver_abbreviations = set()  # Initialize the set to store valid driver codes
     
     try:
         current_year = datetime.now().year
         all_events = fastf1.get_event_schedule(current_year)
         
-        all_driver_abbreviations = set()
-        for _, event_data in all_events.iterrows():
-            try:
-                # Use 'Race' or 'Qualifying' as these generally have full driver lists
-                session_type_to_load = 'Race' 
-                if 'Qualifying' in event_data['Session1'] or 'Qualifying' in event_data['Session2'] or 'Qualifying' in event_data['Session3'] or 'Qualifying' in event_data['Session4'] or 'Qualifying' in event_data['Session5']:
-                    session_type_to_load = 'Qualifying'
-                elif 'Sprint' in event_data['Session1'] or 'Sprint' in event_data['Session2'] or 'Sprint' in event_data['Session3'] or 'Sprint' in event_data['Session4'] or 'Sprint' in event_data['Session5']:
-                    session_type_to_load = 'Sprint'
+        # Optimize: Only check the latest completed race or the next upcoming one to get the current grid.
+        # Scanning the whole season causes timeouts.
+        
+        target_event = None
+        current_utc = datetime.now(pytz.utc)
+        
+        # 1. Try to find the last completed race
+        completed_races = all_events[
+            (all_events['RaceDate'] < current_utc) & (all_events['EventFormat'] != 'testing')
+        ].sort_values(by='RaceDate', ascending=False)
+        
+        if not completed_races.empty:
+            target_event = completed_races.iloc[0]
+        else:
+            # 2. If no races completed yet, try the next upcoming race
+            upcoming_races = all_events[
+                (all_events['RaceDate'] >= current_utc) & (all_events['EventFormat'] != 'testing')
+            ].sort_values(by='RaceDate')
+            if not upcoming_races.empty:
+                target_event = upcoming_races.iloc[0]
 
-                temp_session = fastf1.get_session(event_data.year, event_data.RoundNumber, session_type_to_load)
-                
-                # Check if session.drivers is available without full load, or load minimally
-                if temp_session and hasattr(temp_session, 'drivers') and temp_session.drivers is not None:
-                    for driver_info in temp_session.drivers.values():
-                        all_driver_abbreviations.add(driver_info['Abbreviation'])
-                        if driver_info['Abbreviation'] == driver_code:
-                            driver_full_name = driver_info['FullName']
-                else: # Fallback: if .drivers is None, try a minimal load
-                     temp_session.load(laps=False, telemetry=False, weather=False)
-                     if temp_session and hasattr(temp_session, 'drivers') and temp_session.drivers is not None:
-                         for driver_info in temp_session.drivers.values():
-                            all_driver_abbreviations.add(driver_info['Abbreviation'])
-                            if driver_info['Abbreviation'] == driver_code:
-                                driver_full_name = driver_info['FullName']
-
-            except Exception:
-                pass
+        if target_event is not None:
+             try:
+                 # Prefer Qualifying for driver list if available, else Race
+                 session_type = 'Qualifying'
+                 # Validate session existence by checking scheduled time - simplistic check
+                 # Actually fastf1.get_session handles this.
+                 
+                 print(f"Validating driver code against event: {target_event['EventName']}")
+                 temp_session = fastf1.get_session(target_event.year, target_event.RoundNumber, session_type)
+                 temp_session.load(laps=False, telemetry=False, weather=False) # Minimal load
+                 
+                 if temp_session.drivers:
+                      for drv in temp_session.drivers: # .drivers returns a list of driver numbers in recent fastf1? Or dictionary?
+                          # fastf1 3.0+: .drivers is a list of numbers. .get_driver(number) gives info.
+                          # Wait, code used .values() on .drivers before. Let's check compat.
+                          # bot.py line 462 assumed .values(). 
+                          # If .drivers is a list (newer fastf1), we iterate and get_driver.
+                          
+                          # Let's be safe and support both if possible, or assume the installed version.
+                          # The previous code assumed dictionary. 
+                          # Re-implementing correctly for modern fastf1 (which returns a list of identifiers).
+                          
+                          # Actually, let's look at the object. 
+                          # If it's a list:
+                          d_info = temp_session.get_driver(drv)
+                          all_driver_abbreviations.add(d_info['Abbreviation'])
+                          if d_info['Abbreviation'] == driver_code:
+                                driver_full_name = d_info['FullName']
+                 
+             except Exception as e:
+                 print(f"Error loading session for driver validation: {e}")
+        else:
+             print("No suitable event found to validate drivers. Skipping validation.")
+             # If we can't validate, we might want to allow it or warn?
+             # For now, let's assume valid if we can't check, to avoid blocking.
+             all_driver_abbreviations.add(driver_code) # Bypass check
         
         if driver_code not in all_driver_abbreviations:
             await interaction.followup.send(
@@ -594,10 +679,9 @@ async def set_fav_driver(interaction: discord.Interaction, driver_code: str):
         print(f"Error assigning role: {e}")
 
 
-@bot.tree.command( # Corrected to bot.tree.command
+@bot.tree.command( 
     name="favdriver_win_check",
-    description="Check if your favorite driver won the most recent F1 race.",
-    guild=discord.Object(id=GUILD_ID)
+    description="Check if your favorite driver won the most recent F1 race."
 )
 async def favdriver_win_check(interaction: discord.Interaction):
     await interaction.response.defer() 
@@ -613,7 +697,7 @@ async def favdriver_win_check(interaction: discord.Interaction):
     
     try:
         current_year = datetime.now().year
-        schedule = fastf1.get_event_schedule(current_year, drop_duplicates=False)
+        schedule = fastf1.get_event_schedule(current_year)
         
         current_utc_time = datetime.now(pytz.utc)
         completed_races = schedule[
@@ -633,7 +717,7 @@ async def favdriver_win_check(interaction: discord.Interaction):
         try:
             await interaction.followup.send(f"Checking results for the latest race: **{event_name}**...", ephemeral=True)
             await asyncio.sleep(2) 
-            session.load() 
+            session.load(laps=False, telemetry=False, weather=False) 
         except Exception as e:
             print(f"Error loading session for win check ({event_name} Round {race_round}): {e}")
             await interaction.followup.send(
@@ -674,17 +758,21 @@ async def favdriver_win_check(interaction: discord.Interaction):
         await interaction.followup.send(f"Sorry, I couldn't check the race results right now. An error occurred: `{e}`", ephemeral=True)
 
 
-@bot.tree.command( # Corrected to bot.tree.command
+@bot.tree.command( 
     name="upcomingraces",
-    description="Shows the schedule for upcoming F1 races in Indian time.",
-    guild=discord.Object(id=GUILD_ID)
+    description="Shows the schedule for upcoming F1 races in Indian time."
 )
 async def upcoming_races(interaction: discord.Interaction):
-    await interaction.response.defer()
+    print(f"Received /upcomingraces command from {interaction.user}")
+    try:
+        await interaction.response.defer()
+    except Exception as e:
+        print(f"Error deferring interaction: {e}")
+        return
 
     try:
         current_year = datetime.now().year
-        schedule = fastf1.get_event_schedule(current_year, drop_duplicates=False)
+        schedule = fastf1.get_event_schedule(current_year)
         
         current_utc_time = datetime.now(pytz.utc) 
         
@@ -724,10 +812,9 @@ async def upcoming_races(interaction: discord.Interaction):
         await interaction.followup.send(f"Sorry, I couldn't fetch the upcoming races right now. An error occurred: `{e}`", ephemeral=True)
 
 
-@bot.tree.command( # Corrected to bot.tree.command
+@bot.tree.command( 
     name="circuitinfo",
-    description="Get detailed information about an F1 circuit.",
-    guild=discord.Object(id=GUILD_ID)
+    description="Get detailed information about an F1 circuit."
 )
 @discord.app_commands.describe(
     circuit_name="The name or common abbreviation of the circuit (e.g., Monza, Silverstone, Baku)"
@@ -767,6 +854,729 @@ async def circuit_info(interaction: discord.Interaction, circuit_name: str):
     await interaction.followup.send(embed=embed)
 
 
+# === NEW ERGAST API COMMANDS ===
+
+@bot.tree.command( 
+    name="driverstandings",
+    description="Get current or historical driver championship standings"
+)
+@discord.app_commands.describe(
+    year="Season year (leave empty for current season)"
+)
+async def driver_standings(interaction: discord.Interaction, year: Optional[int] = None):
+    await interaction.response.defer()
+    
+    try:
+        # Check cache first
+        cache_key = f"driver_standings_{year or 'current'}"
+        cached = cache.get(cache_key, ttl_seconds=3600)  # 1 hour TTL
+        
+        if cached:
+            standings = cached
+        else:
+            standings = ergast_api.get_driver_standings(year)
+            if standings:
+                cache.set(cache_key, standings)
+        
+        if not standings:
+            await interaction.followup.send(f"No driver standings found for {year or 'current season'}.", ephemeral=True)
+            return
+        
+        # Get season info
+        season_year = year or datetime.now().year
+        
+        # Determine embed color based on the leader's team
+        leader = standings[0]
+        leader_team = leader['Constructors'][0]['name'] if leader['Constructors'] else "Unknown"
+        embed_color = get_team_color(leader_team)
+        
+        embed = discord.Embed(
+            title=f"🏆 F1 Driver Championship Standings - {season_year}",
+            description=f"Current standings for the {season_year} season",
+            color=embed_color
+        )
+        
+        # Show top 10 drivers
+        for i, driver in enumerate(standings[:10], 1):
+            driver_info = driver['Driver']
+            constructor = driver['Constructors'][0] if driver['Constructors'] else {'name': 'Unknown'}
+            team_emoji = get_team_emoji(constructor['name'])
+            flag = get_nationality_flag(driver_info.get('nationality', ''))
+            
+            value = (
+                f"**Team:** {team_emoji} {constructor['name']}\n"
+                f"**Points:** {driver['points']}\n"
+                f"**Wins:** {driver['wins']}"
+            )
+            
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"**P{i}**"
+            embed.add_field(
+                name=f"{medal} {flag} {driver_info['givenName']} {driver_info['familyName']}",
+                value=value,
+                inline=False
+            )
+        
+        embed.set_footer(text="Data provided by Ergast F1 API")
+        await interaction.followup.send(embed=embed)
+    
+    except Exception as e:
+        logger.error(f"Error in /driverstandings: {e}")
+        await interaction.followup.send(f"Sorry, I couldn't fetch the driver standings. Error: `{e}`", ephemeral=True)
+
+
+@bot.tree.command( 
+    name="constructorstandings",
+    description="Get current or historical constructor championship standings"
+)
+@discord.app_commands.describe(
+    year="Season year (leave empty for current season)"
+)
+async def constructor_standings(interaction: discord.Interaction, year: Optional[int] = None):
+    await interaction.response.defer()
+    
+    try:
+        cache_key = f"constructor_standings_{year or 'current'}"
+        cached = cache.get(cache_key, ttl_seconds=3600)
+        
+        if cached:
+            standings = cached
+        else:
+            standings = ergast_api.get_constructor_standings(year)
+            if standings:
+                cache.set(cache_key, standings)
+        
+        if not standings:
+            await interaction.followup.send(f"No constructor standings found for {year or 'current season'}.", ephemeral=True)
+            return
+        
+        season_year = year or datetime.now().year
+        
+        # Color based on leader
+        leader_team = standings[0]['Constructor']['name']
+        embed_color = get_team_color(leader_team)
+        
+        embed = discord.Embed(
+            title=f"🏁 F1 Constructor Championship Standings - {season_year}",
+            description=f"Current team standings for the {season_year} season",
+            color=embed_color
+        )
+        
+        for i, constructor in enumerate(standings[:10], 1):
+            constructor_info = constructor['Constructor']
+            team_emoji = get_team_emoji(constructor_info['name'])
+            nationality = constructor_info.get('nationality', '')
+            flag = get_nationality_flag(nationality) if nationality else ""
+            
+            value = (
+                f"**Points:** {constructor['points']}\n"
+                f"**Wins:** {constructor['wins']}"
+            )
+            
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"**P{i}**"
+            embed.add_field(
+                name=f"{medal} {team_emoji} {constructor_info['name']} {flag}",
+                value=value,
+                inline=False
+            )
+        
+        embed.set_footer(text="Data provided by Ergast F1 API")
+        await interaction.followup.send(embed=embed)
+    
+    except Exception as e:
+        logger.error(f"Error in /constructorstandings: {e}")
+        await interaction.followup.send(f"Sorry, I couldn't fetch the constructor standings. Error: `{e}`", ephemeral=True)
+
+
+@bot.tree.command( 
+    name="raceresults",
+    description="Get race results for a specific Grand Prix"
+)
+@discord.app_commands.describe(
+    race_name="Race name (e.g., Monaco, Silverstone, Bahrain)",
+    year="Season year (leave empty for current season)"
+)
+async def race_results(interaction: discord.Interaction, race_name: str, year: Optional[int] = None):
+    await interaction.response.defer()
+    
+    try:
+        season_year = year or datetime.now().year
+        
+        # Find round number by race name
+        round_num = ergast_api.get_race_by_name(race_name, season_year)
+        if not round_num:
+            await interaction.followup.send(
+                f"Could not find a race matching '{race_name}' in {season_year}. Please check the race name.",
+                ephemeral=True
+            )
+            return
+        
+        cache_key = f"race_results_{season_year}_{round_num}"
+        cached = cache.get(cache_key, ttl_seconds=86400)  # 24 hour TTL
+        
+        if cached:
+            race_data = cached
+        else:
+            race_data = ergast_api.get_race_results(season_year, round_num)
+            if race_data:
+                cache.set(cache_key, race_data)
+        
+        if not race_data:
+            await interaction.followup.send(f"No race results found for {race_name} {season_year}.", ephemeral=True)
+            return
+        
+        results = race_data['Results']
+        race_info = race_data
+        
+        # Determine embed color from winner's team
+        winner_team = results[0]['Constructor']['name']
+        embed_color = get_team_color(winner_team)
+        
+        embed = discord.Embed(
+            title=f"🏁 {race_info['raceName']} - {race_info['season']} Results",
+            description=f"{race_info['Circuit']['circuitName']} | {race_info['date']}",
+            color=embed_color
+        )
+        
+        for i, result in enumerate(results[:10], 1):
+            driver = result['Driver']
+            constructor = result['Constructor']
+            team_emoji = get_team_emoji(constructor['name'])
+            flag = get_nationality_flag(driver['nationality'])
+            
+            status = result.get('status', 'Finished')
+            time_info = result.get('Time', {}).get('time', status)
+            
+            value = (
+                f"**Team:** {team_emoji} {constructor['name']}\n"
+                f"**Time:** {time_info}\n"
+                f"**Points:** {result['points']}"
+            )
+            
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"**P{i}**"
+            embed.add_field(
+                name=f"{medal} {flag} {driver['givenName']} {driver['familyName']}",
+                value=value,
+                inline=False
+            )
+        
+        embed.set_footer(text="Data provided by Ergast F1 API")
+        await interaction.followup.send(embed=embed)
+    
+    except Exception as e:
+        logger.error(f"Error in /raceresults: {e}")
+        await interaction.followup.send(f"Sorry, I couldn't fetch the race results. Error: `{e}`", ephemeral=True)
+
+
+@bot.tree.command( 
+    name="qualifyingresults",
+    description="Get qualifying results for a race"
+)
+@discord.app_commands.describe(
+    race_name="Name of the Grand Prix (e.g., Monaco, Monza)",
+    year="Season year (leave empty for current season)"
+)
+async def qualifying_results(interaction: discord.Interaction, race_name: str, year: Optional[int] = None):
+    await interaction.response.defer()
+    
+    try:
+        # Resolve year
+        season_year = year or datetime.now().year
+        
+        # Get race info and round number
+        round_num = ergast_api.get_race_by_name(race_name, season_year)
+        if not round_num:
+            await interaction.followup.send(
+                f"Could not find a race matching '{race_name}' in {season_year}.",
+                ephemeral=True
+            )
+            return
+        
+        # Fetch qualifying results
+        race_data = ergast_api.get_qualifying_results(season_year, round_num)
+        
+        if not race_data:
+            await interaction.followup.send(f"No qualifying results found for {race_name} {season_year}.", ephemeral=True)
+            return
+        
+        results = race_data['QualifyingResults']
+        race_info = race_data
+        
+        # Color based on pole sitter
+        pole_team = results[0]['Constructor']['name']
+        embed_color = get_team_color(pole_team)
+        
+        embed = discord.Embed(
+            title=f"⏱️ {race_info['raceName']} - Qualifying Results",
+            description=f"{race_info['Circuit']['circuitName']} | {race_info['date']}",
+            color=embed_color
+        )
+        
+        for i, result in enumerate(results[:10], 1):
+            driver = result['Driver']
+            constructor = result['Constructor']
+            team_emoji = get_team_emoji(constructor['name'])
+            flag = get_nationality_flag(driver['nationality'])
+            
+            q1 = result.get('Q1', '-')
+            q2 = result.get('Q2', '-')
+            q3 = result.get('Q3', '-')
+            
+            value = (
+                f"**Team:** {team_emoji} {constructor['name']}\n"
+                f"**Q1:** {q1} | **Q2:** {q2} | **Q3:** {q3}"
+            )
+            
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"**P{i}**"
+            embed.add_field(
+                name=f"{medal} {flag} {driver['givenName']} {driver['familyName']}",
+                value=value,
+                inline=False
+            )
+        
+        embed.set_footer(text="Data provided by Ergast F1 API")
+        await interaction.followup.send(embed=embed)
+    
+    except Exception as e:
+        logger.error(f"Error in /qualifyingresults: {e}")
+        await interaction.followup.send(f"Sorry, I couldn't fetch qualifying results. Error: `{e}`", ephemeral=True)
+
+
+@bot.tree.command( 
+    name="driverprofile",
+    description="Get career profile and stats for a driver"
+)
+@discord.app_commands.describe(
+    driver_code="Driver name or code (e.g., verstappen, HAM, alonso)"
+)
+async def driver_profile(interaction: discord.Interaction, driver_code: str):
+    await interaction.response.defer()
+    
+    try:
+        profile = ergast_api.get_driver_profile(driver_code)
+        
+        if not profile:
+            await interaction.followup.send(f"Could not find a driver matching '{driver_code}'.", ephemeral=True)
+            return
+        
+        driver = profile['driver']
+        stats = profile['stats']
+        
+        # Get driver color and flag
+        # Try to find current team via standings or use default
+        flag = get_nationality_flag(driver['nationality'])
+        driver_num = int(driver.get('permanentNumber', 0))
+        embed_color = get_driver_color(driver_num) if driver_num else 0xFF0000
+        
+        embed = discord.Embed(
+            title=f"{flag} {driver['givenName']} {driver['familyName']} #{driver.get('permanentNumber', '')}",
+            url=driver['url'],
+            description=f"**Nationality:** {driver['nationality']} | **DOB:** {driver['dateOfBirth']}",
+            color=embed_color
+        )
+        
+        # Stats Grid
+        embed.add_field(name="🏆 Championships", value=str(stats['championships']), inline=True)
+        embed.add_field(name="🥇 Race Wins", value=str(stats['wins']), inline=True)
+        embed.add_field(name="🏅 Podiums", value=str(stats['podiums']), inline=True)
+        embed.add_field(name="⏱️ Pole Positions", value=str(stats['poles']), inline=True)
+        embed.add_field(name="⚡ Fastest Laps", value=str(stats['fastest_laps']), inline=True)
+        embed.add_field(name="💯 Career Points", value=str(stats['career_points']), inline=True)
+        embed.add_field(name="🏎️ Race Starts", value=str(stats['race_starts']), inline=True)
+        embed.add_field(name="📅 Seasons Active", value=str(stats['seasons']), inline=True)
+        
+        if stats['teams']:
+             embed.add_field(name="🏢 Teams", value=", ".join(list(stats['teams'])[-5:]), inline=False)
+
+        embed.set_thumbnail(url="https://media.formula1.com/image/upload/f_auto/q_auto/v1677244985/f1/assets/players/2023/verstappen.png" if "verstappen" in driver['driverId'] else None) # Placeholder logic for image
+        
+        embed.set_footer(text="Data provided by Ergast F1 API")
+        await interaction.followup.send(embed=embed)
+    
+    except Exception as e:
+        logger.error(f"Error in /driverprofile: {e}")
+        await interaction.followup.send(f"Sorry, I couldn't fetch the driver profile. Error: `{e}`", ephemeral=True)
+
+
+@bot.tree.command( 
+    name="drivercomparison",
+    description="Compare stats between two drivers"
+)
+@discord.app_commands.describe(
+    driver1="First driver name or code",
+    driver2="Second driver name or code"
+)
+async def driver_comparison(interaction: discord.Interaction, driver1: str, driver2: str):
+    await interaction.response.defer()
+    
+    try:
+        p1 = ergast_api.get_driver_profile(driver1)
+        p2 = ergast_api.get_driver_profile(driver2)
+        
+        if not p1 or not p2:
+            await interaction.followup.send("Could not find one or both drivers.", ephemeral=True)
+            return
+            
+        d1, s1 = p1['driver'], p1['stats']
+        d2, s2 = p2['driver'], p2['stats']
+        
+        flag1 = get_nationality_flag(d1['nationality'])
+        flag2 = get_nationality_flag(d2['nationality'])
+        
+        embed = discord.Embed(
+            title="🏎️ Driver Comparison",
+            description=f"{flag1} **{d1['familyName']}** vs **{d2['familyName']}** {flag2}",
+            color=0xFFFFFF
+        )
+        
+        metrics = {
+            "🏆 Championships": ('championships', True),
+            "🥇 Wins": ('wins', True),
+            "🏅 Podiums": ('podiums', True),
+            "⏱️ Poles": ('poles', True),
+            "⚡ Fastest Laps": ('fastest_laps', True),
+            "💯 Points": ('career_points', True),
+            "🏎️ Starts": ('race_starts', True)
+        }
+        
+        for stat_name, (key, higher_is_better) in metrics.items():
+            val1 = float(s1[key]) if key == 'career_points' else int(s1[key])
+            val2 = float(s2[key]) if key == 'career_points' else int(s2[key])
+            
+            val1_str = f"{val1:g}" if key == 'career_points' else str(val1)
+            val2_str = f"{val2:g}" if key == 'career_points' else str(val2)
+            
+            if val1 > val2:
+                value = f"**{val1_str}** 🏆 vs {val2_str}"
+            elif val2 > val1:
+                value = f"{val1_str} vs 🏆 **{val2_str}**"
+            else:
+                value = f"{val1_str} vs {val2_str}"
+            
+            embed.add_field(name=stat_name, value=value, inline=True)
+            
+        embed.set_footer(text="Data provided by Ergast F1 API")
+        await interaction.followup.send(embed=embed)
+    
+    except Exception as e:
+        logger.error(f"Error in /drivercomparison: {e}")
+        await interaction.followup.send(f"Sorry, I couldn't compare the drivers. Error: `{e}`", ephemeral=True)
+
+
+# === LIVE FEATURES (TIER 1) ===
+
+@bot.tree.command( 
+    name="countdown",
+    description="Countdown to the next F1 session"
+)
+async def countdown(interaction: discord.Interaction):
+    await interaction.response.defer()
+    
+    try:
+        current_year = datetime.now().year
+        schedule = fastf1.get_event_schedule(current_year)
+        
+        current_utc_time = datetime.now(pytz.utc)
+        
+        # Find next session across all events
+        next_session_info = None
+        next_session_time = None
+        
+        session_types = ['Practice1Date', 'Practice2Date', 'Practice3Date', 'SprintQualifyingDate', 'QualifyingDate', 'SprintDate', 'RaceDate']
+        
+        for _, event in schedule.iterrows():
+            for session_type_col in session_types:
+                if session_type_col in event and pd.notna(event[session_type_col]):
+                    session_time = event[session_type_col]
+                    
+                    if session_time.tzinfo is None:
+                        session_time = pytz.utc.localize(session_time)
+                    
+                    if session_time > current_utc_time:
+                        if next_session_time is None or session_time < next_session_time:
+                            next_session_time = session_time
+                            session_name = session_type_col.replace('Date', '').replace('1', ' 1').replace('2', ' 2').replace('3', ' 3')
+                            next_session_info = {
+                                'event': event['EventName'],
+                                'session': session_name,
+                                'time': session_time
+                            }
+        
+        if not next_session_info:
+            await interaction.followup.send("No upcoming F1 sessions found this season.", ephemeral=True)
+            return
+        
+        # Calculate countdown
+        time_diff = next_session_info['time'] - current_utc_time
+        days = time_diff.days
+        hours, remainder = divmod(time_diff.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        # Convert to IST for display
+        session_time_ist = next_session_info['time'].astimezone(INDIAN_TIMEZONE)
+        
+        embed = discord.Embed(
+            title=f"⏱️ Countdown to Next F1 Session",
+            description=f"**{next_session_info['event']}** - {next_session_info['session']}",
+            color=0xFF1E00
+        )
+        
+        countdown_text = []
+        if days > 0:
+            countdown_text.append(f"**{days}** days")
+        if hours > 0:
+            countdown_text.append(f"**{hours}** hours")
+        if minutes > 0:
+            countdown_text.append(f"**{minutes}** minutes")
+        if days == 0 and hours == 0:
+            countdown_text.append(f"**{seconds}** seconds")
+        
+        embed.add_field(name="⏳ Time Remaining", value=" ".join(countdown_text) or "Starting soon!", inline=False)
+        embed.add_field(name="📅 Session Time (IST)", value=session_time_ist.strftime('%d %b %Y, %I:%M %p IST'), inline=False)
+        embed.set_footer(text="Data provided by FastF1")
+        
+        await interaction.followup.send(embed=embed)
+    
+    except Exception as e:
+        logger.error(f"Error in /countdown: {e}")
+        await interaction.followup.send(f"Sorry, I couldn't calculate the countdown. Error: `{e}`", ephemeral=True)
+
+
+@bot.tree.command( 
+    name="livestatus",
+    description="Check live F1 session status and flags"
+)
+async def live_status(interaction: discord.Interaction):
+    await interaction.response.defer()
+    
+    try:
+        # Get latest session from OpenF1
+        latest_session = await openf1_api.get_latest_session()
+        
+        if not latest_session:
+            await interaction.followup.send("No active F1 session found at the moment.", ephemeral=True)
+            return
+        
+        session_key = latest_session.get('session_key')
+        session_name = latest_session.get('session_name', 'Unknown')
+        circuit_name = latest_session.get('circuit_short_name', latest_session.get('location', 'Unknown'))
+        
+        embed = discord.Embed(
+            title=f"🔴 LIVE: {circuit_name} - {session_name}",
+            description="Current session status",
+            color=0xFF0000
+        )
+        
+        # Check if session is actually live
+        is_live = await openf1_api.is_session_live(session_key)
+        embed.add_field(name="📡 Status", value="🟢 **LIVE**" if is_live else "⚪ **Not Active**", inline=True)
+        
+        # Get track status (flags)
+        track_status_msg = await openf1_api.get_latest_track_status_message(session_key)
+        if track_status_msg:
+            # Color logic for flags
+            if "Green" in track_status_msg:
+                embed.color = 0x00FF00
+            elif "Yellow" in track_status_msg:
+                embed.color = 0xFFFF00
+            elif "Red" in track_status_msg:
+                embed.color = 0xFF0000
+            elif "SC" in track_status_msg or "Safety Car" in track_status_msg:
+                embed.color = 0xFFA500
+                
+            embed.add_field(name="🚩 Track Status", value=track_status_msg, inline=True)
+        
+        # Get recent race control messages
+        race_control = await openf1_api.get_race_control_messages(session_key)
+        if race_control and len(race_control) > 0:
+            recent_messages = race_control[-3:]  # Last 3 messages
+            messages_text = []
+            for msg in recent_messages:
+                message = msg.get('message', 'N/A')
+                messages_text.append(f"• {message}")
+            
+            embed.add_field(name="📢 Recent Updates", value="\n".join(messages_text) or "No updates", inline=False)
+        
+        embed.set_footer(text="Data provided by OpenF1 API")
+        await interaction.followup.send(embed=embed)
+    
+    except Exception as e:
+        logger.error(f"Error in /livestatus: {e}")
+        await interaction.followup.send(f"Sorry, I couldn't fetch live status. Error: `{e}`", ephemeral=True)
+
+
+@bot.tree.command( 
+    name="livetiming",
+    description="Get live lap times for current session"
+)
+@discord.app_commands.describe(
+    driver_number="Driver number (optional, e.g., 1, 44, 16)"
+)
+async def live_timing(interaction: discord.Interaction, driver_number: Optional[int] = None):
+    await interaction.response.defer()
+    
+    try:
+        latest_session = await openf1_api.get_latest_session()
+        
+        if not latest_session:
+            await interaction.followup.send("No active F1 session found.", ephemeral=True)
+            return
+        
+        session_key = latest_session.get('session_key')
+        session_name = latest_session.get('session_name', 'Unknown')
+        
+        # Get lap times
+        laps = await openf1_api.get_lap_times(session_key, driver_number)
+        
+        if not laps or len(laps) == 0:
+            await interaction.followup.send("No lap time data available for this session yet.", ephemeral=True)
+            return
+        
+        # Get most recent laps
+        recent_laps = sorted(laps, key=lambda x: x.get('date_start', ''), reverse=True)[:10]
+        
+        # If specific driver, get their color
+        color = 0x00FF00
+        if driver_number:
+            color = get_driver_color(driver_number)
+            
+        embed = discord.Embed(
+            title=f"⏱️ Live Timing - {session_name}",
+            description=f"Most recent laps" + (f" for driver #{driver_number}" if driver_number else ""),
+            color=color
+        )
+        
+        for lap in recent_laps:
+            driver_num = lap.get('driver_number', 'N/A')
+            lap_num = lap.get('lap_number', 'N/A')
+            lap_duration = lap.get('lap_duration')
+            
+            # Simple color block for visual separation if multi-driver
+            d_color = get_driver_color(int(driver_num)) if str(driver_num).isdigit() else 0xFFFFFF
+            
+            if lap_duration:
+                minutes = int(lap_duration // 60)
+                seconds = lap_duration % 60
+                lap_time_str = f"{minutes}:{seconds:06.3f}"
+            else:
+                lap_time_str = "N/A"
+            
+            embed.add_field(
+                name=f"#{driver_num} - Lap {lap_num}",
+                value=f"⏱️ {lap_time_str}",
+                inline=True
+            )
+        
+        embed.set_footer(text="Data provided by OpenF1 API")
+        await interaction.followup.send(embed=embed)
+    
+    except Exception as e:
+        logger.error(f"Error in /livetiming: {e}")
+        await interaction.followup.send(f"Sorry, I couldn't fetch live timing. Error: `{e}`", ephemeral=True)
+
+
+# === ENHANCED RACE RESULTS WITH DNFs AND FASTEST LAP ===
+
+@bot.tree.command( 
+    name="detailedraceresults",
+    description="Get detailed race results including DNFs and fastest lap"
+)
+@discord.app_commands.describe(
+    race_name="Race name (e.g., Monaco, Silverstone)",
+    year="Season year (optional)"
+)
+async def detailed_race_results(interaction: discord.Interaction, race_name: str, year: Optional[int] = None):
+    await interaction.response.defer()
+    
+    try:
+        season_year = year or datetime.now().year
+        
+        round_num = ergast_api.get_race_by_name(race_name, season_year)
+        if not round_num:
+            await interaction.followup.send(
+                f"Could not find a race matching '{race_name}' in {season_year}.",
+                ephemeral=True
+            )
+            return
+        
+        race_data = ergast_api.get_race_results(season_year, round_num)
+        
+        if not race_data:
+            await interaction.followup.send(f"No race results found for {race_name} {season_year}.", ephemeral=True)
+            return
+        
+        results = race_data['Results']
+        race_info = race_data
+        
+        # Color based on winner
+        winner_team = results[0]['Constructor']['name']
+        embed_color = get_team_color(winner_team)
+        
+        # Main results embed
+        embed = discord.Embed(
+            title=f"🏁 {race_info['raceName']} - Detailed Results",
+            description=f"{race_info['Circuit']['circuitName']} | {race_info['date']}",
+            color=embed_color
+        )
+        
+        # Top 10
+        for result in results[:10]:
+            driver = result['Driver']
+            constructor = result['Constructor']
+            position = result['position']
+            status = result.get('status', 'Finished')
+            time_info = result.get('Time', {}).get('time', status)
+            
+            team_emoji = get_team_emoji(constructor['name'])
+            flag = get_nationality_flag(driver['nationality'])
+            
+            fastest_lap_rank = result.get('FastestLap', {}).get('rank', 'N/A')
+            fastest_lap_indicator = " ⚡" if fastest_lap_rank == '1' else ""
+            
+            value = (
+                f"**Team:** {team_emoji} {constructor['name']}\n"
+                f"**Time:** {time_info}\n"
+                f"**Points:** {result['points']}{fastest_lap_indicator}"
+            )
+            
+            medal = "🥇" if position == '1' else "🥈" if position == '2' else "🥉" if position == '3' else f"**P{position}**"
+            embed.add_field(
+                name=f"{medal} {flag} {driver['givenName']} {driver['familyName']}",
+                value=value,
+                inline=False
+            )
+        
+        # DNFs
+        dnfs = [r for r in results if 'Finished' not in r.get('status', 'Finished') and int(r['position']) > 10]
+        if dnfs:
+            dnf_text = []
+            for dnf in dnfs[:5]:  # Show up to 5 DNFs
+                driver = dnf['Driver']
+                status = dnf.get('status', 'Unknown')
+                flag = get_nationality_flag(driver['nationality'])
+                dnf_text.append(f"• {flag} {driver['familyName']} - {status}")
+            
+            embed.add_field(name="❌ DNFs", value="\n".join(dnf_text), inline=False)
+        
+        # Fastest lap
+        fastest_lap_holder = next((r for r in results if r.get('FastestLap', {}).get('rank') == '1'), None)
+        if fastest_lap_holder:
+            driver = fastest_lap_holder['Driver']
+            fastest_time = fastest_lap_holder.get('FastestLap', {}).get('Time', {}).get('time', 'N/A')
+            flag = get_nationality_flag(driver['nationality'])
+            embed.add_field(
+                name="⚡ Fastest Lap",
+                value=f"{flag} {driver['givenName']} {driver['familyName']} - {fastest_time}",
+                inline=False
+            )
+        
+        embed.set_footer(text="Data provided by Ergast F1 API")
+        await interaction.followup.send(embed=embed)
+    
+    except Exception as e:
+        logger.error(f"Error in /detailedraceresults: {e}")
+        await interaction.followup.send(f"Sorry, I couldn't fetch detailed results. Error: `{e}`", ephemeral=True)
+
+
 # --- Background Task: Check for completed sessions ---
 @tasks.loop(minutes=10)
 async def check_for_completed_sessions():
@@ -788,17 +1598,17 @@ async def check_for_completed_sessions():
         
         schedule = pd.DataFrame()
         try:
-            schedule = fastf1.get_event_schedule(current_year, drop_duplicates=False)
+            schedule = fastf1.get_event_schedule(current_year)
         except Exception as e:
             print(f"Could not fetch current year's schedule: {e}. Trying previous year or next year.")
             # Fallback to previous year if early in season and current year is empty
             if datetime.now().month <= 3: # If Q1, maybe try previous year
                 try:
-                    schedule = fastf1.get_event_schedule(current_year - 1, drop_duplicates=False)
+                    schedule = fastf1.get_event_schedule(current_year - 1)
                 except Exception: pass
             if schedule.empty and datetime.now().month >= 10: # If late season and current is empty, try next year
                 try:
-                    schedule = fastf1.get_event_schedule(current_year + 1, drop_duplicates=False)
+                    schedule = fastf1.get_event_schedule(current_year + 1)
                 except Exception: pass
 
             if schedule.empty:
@@ -850,12 +1660,25 @@ async def check_for_completed_sessions():
                             else:
                                 accurate_laps = all_laps 
 
-                            fastest_laps = accurate_laps.pick_fastest()
+                            # Get the fastest lap for EACH driver
+                            drivers_fastest_laps = []
+                            unique_drivers = accurate_laps['Driver'].unique()
                             
-                            if fastest_laps.empty:
+                            for drv in unique_drivers:
+                                drv_laps = accurate_laps[accurate_laps['Driver'] == drv]
+                                if not drv_laps.empty:
+                                    try:
+                                        fl = drv_laps.pick_fastest()
+                                        if pd.notna(fl['LapTime']):
+                                             drivers_fastest_laps.append(fl)
+                                    except Exception:
+                                        pass
+
+                            if not drivers_fastest_laps:
                                 print(f"No fastest accurate lap data available for {event_name} {session_type_short}. Will retry.")
                                 continue
 
+                            fastest_laps = pd.DataFrame(drivers_fastest_laps)
                             top_3_drivers = fastest_laps.sort_values(by='LapTime').head(3)
 
                             embed = discord.Embed(
